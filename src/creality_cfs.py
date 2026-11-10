@@ -1,6 +1,19 @@
 """
 creality_cfs.py: Klipper Extra Module for Creality Filament System (CFS)
 
+Creality-Hi-Kalico port (2026-11-10) of gitstonelabs/creality-cfs-klipper,
+src/creality_cfs.py at commit 16309d8, GPL-3.0. One addition, marked "shared bus":
+  * Optional "serial" option naming a [serial_485] section (for example
+    "serial: serial_485 serial485"). When set, the module does not open the RS-485 port:
+    every exchange goes through that shared transport. On the Creality Hi the port is
+    also the bus of the closed-loop X/Y motor drivers, so two owners cannot coexist.
+    serial_port, baud and rts_on_send are then ignored.
+  * On the shared bus, frames pushed by the box without a request are not seen (the
+    transport drops frames that answer no pending request), and
+    read_buffer_block_0x0c() does not transmit: its frame goes to 0x81/0x82, which are
+    the X/Y motor drivers on the Hi.
+Without the option the module behaves as upstream. Protocol and choreography unchanged.
+
 Protocol version: CFS RS485 v1 (single version)
 Klipper compatibility: v0.11.0+
 License: GPL-3.0 (matching Klipper project)
@@ -1028,6 +1041,10 @@ class CrealityCFS:
         # port is actually opened, not at construction.
         self._baud_const = None
 
+        # Shared bus: name of a [serial_485] section to use instead of opening the port.
+        self.serial_name = config.get("serial", None)
+        self._bus = None
+
         # --- Internal state (reactor-driven, non-blocking transport; v1.3.0) ---
         self._fd: int = None                 # raw non-blocking tty file descriptor
         self._fd_handle = None               # ReactorFileHandler from reactor.register_fd
@@ -1334,6 +1351,17 @@ class CrealityCFS:
             OSError: If the port cannot be opened or configured.
             RuntimeError: If opened off-POSIX (no fcntl/termios available).
         """
+        if self.serial_name is not None:
+            # Shared bus: use the serial_485 transport instead of opening the tty.
+            bus = self.printer.lookup_object(self.serial_name, None)
+            if bus is None:
+                raise RuntimeError(
+                    "creality_cfs: no [%s] section to share the bus with" % self.serial_name
+                )
+            self._bus = bus
+            self.is_connected = True
+            logger.info("creality_cfs: using shared bus [%s]", self.serial_name)
+            return
         if not _HAS_POSIX_SERIAL:
             raise RuntimeError(
                 "creality_cfs: the live RS-485 transport requires a POSIX host "
@@ -1405,6 +1433,7 @@ class CrealityCFS:
 
     def _disconnect_serial(self) -> None:
         """Unregister the fd from the reactor and close the port if open."""
+        self._bus = None  # shared bus: serial_485 owns and closes the port
         if self._fd_handle is not None:
             try:
                 self.reactor.unregister_fd(self._fd_handle)
@@ -1457,7 +1486,7 @@ class CrealityCFS:
                   after all retries (for addressing commands that may legitimately have no
                   responders), if the bus is quiescing, or on a write error.
         """
-        if not self.is_connected or self._fd is None:
+        if not self.is_connected or (self._fd is None and self._bus is None):
             raise RuntimeError("creality_cfs: serial port not connected")
         if self._shutdown:
             # Do not start new traffic (or park in completion.wait) against a tearing-down bus.
@@ -1551,6 +1580,19 @@ class CrealityCFS:
             None: On timeout / no response.
             self._TXN_WRITE_ERROR: If the write itself failed (caller breaks the retry loop).
         """
+        if self._bus is not None:
+            # Shared bus: one exchange through serial_485. It takes the frame without the
+            # 0xF7 head and the CRC (it adds both), serializes the bus with its other
+            # users, matches the reply on (addr, func) with the same broadcast rule as
+            # _dispatch_rx, and returns the whole reply frame or None on timeout.
+            try:
+                raw = self._bus.cmd_send_data_with_response(
+                    bytes(request_bytes[1:-1]), timeout)
+            except Exception as exc:
+                logger.error("creality_cfs: shared bus error: %s", exc)
+                return self._TXN_WRITE_ERROR
+            return bytes(raw) if raw else None
+
         # Fresh completion per exchange; register it as the pending matcher BEFORE the write
         # so a fast reply cannot race ahead of us.
         comp = self.reactor.completion()
@@ -2355,6 +2397,11 @@ class CrealityCFS:
 
         Returns {"bytes","empty"} or None on no response.
         """
+        if self._bus is not None:
+            # Shared bus: 0x81/0x82 are the X/Y motor drivers there and this frame is
+            # their error query; the CFS module must not talk to them.
+            logger.warning("creality_cfs: 0x0C block read to 0x%02X not sent", node_addr)
+            return None
         resp = self._send_command(node_addr, 0x00, CMD_BUFFER_BLOCK_0X0C,
                                   data=bytes([0x0B]), retries=1)
         if resp is None:
